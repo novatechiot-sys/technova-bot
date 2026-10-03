@@ -19,6 +19,7 @@ const cfg = {
   // AI model on Groq (OpenAI-compatible API)
   groqKey: process.env.GROQ_API_KEY,
   model: process.env.LLM_MODEL || "openai/gpt-oss-120b",
+  visionModel: process.env.VISION_MODEL || "qwen/qwen3.8-27b",
   // Website chat
   allowedOrigins: (process.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean),
   // TechNova Apps Script relay: saves leads in the sheet and emails alerts to Jackson
@@ -78,6 +79,7 @@ Your job:
    - Never state a total yourself; the PDF has the exact numbers. Never put a site visit fee in a quote.
 5. ACCEPTING: when the customer accepts a quotation ("nakubali", "I accept", "let's go ahead"), call accept_quote. It sends the deposit invoice (jobs above TZS 200,000) and opens a job card. Then offer to book the visit.
 6. BOOKING: to book a site visit (kind "site_visit") or the work itself (kind "job"), first make sure you have their name, phone number and exact location. Call get_slots, show the options as a short numbered list, and when they choose, call book_slot with that slot's start value. Never invent times; only offer slots from get_slots.
+PHOTOS: customers can send photos with the 📎 button. You receive a description of each photo in [brackets]. Use it naturally ("I can see the screen is cracked on the left side"), ask for a clearer photo if needed, and suggest sending one when it would help (a broken device, a model label, a wall or site for CCTV). Never say you cannot see photos. Photos are saved for Jackson automatically.
 7. JOB STATUS: when someone asks about a repair or job, ask for their job number (like TN-J-2026-014) and the last 4 digits of their phone number, then call check_job. Report only what it returns.
 8. Call handover_to_human when: the customer wants a discount, complains, has an urgent problem, no slot suits them, asks something you cannot answer, or asks for a person.
    After a handover, tell the customer Jackson from TechNova will contact them shortly.
@@ -255,10 +257,34 @@ async function alertOwner(subject, text) {
 
 async function saveLead(key, channel, input) {
   const convo = getConvo(key);
+  convo.leadSaved = true;
   const lead = Object.assign(convo.lead, Object.fromEntries(Object.entries(input).filter(([, v]) => v)));
   if (channel === "whatsapp" && !lead.phone) lead.phone = "+" + key.slice(3);
   const r = await relay({ action: "lead", key, source: channel === "web" ? "Website chat" : "WhatsApp", lead });
   return r && r.ok ? "Lead saved" : "Lead noted";
+}
+
+// ---------------------------------------------------------------------------
+// Photos: a vision model describes the photo; the description goes into the conversation
+// ---------------------------------------------------------------------------
+async function describePhoto(dataUrl, customerText) {
+  const prompt = "You help a Tanzanian electronics, CCTV, IoT and software company understand a photo a customer sent. " +
+    "In 2-4 short sentences of English, describe what is shown that matters for the job: the device type, brand/model if visible, " +
+    "the visible damage or problem, or for a building/site: the type of place, walls, size, where cameras/Wi-Fi/sensors could go. " +
+    "If text is visible (error messages, model labels), quote it. If the photo is unclear, say so. Do not guess prices." +
+    (customerText ? ` The customer wrote: "${customerText.slice(0, 300)}"` : "");
+  const body = (extra) => JSON.stringify(Object.assign({
+    model: cfg.visionModel, temperature: 0.2, max_completion_tokens: 600,
+    messages: [{ role: "user", content: [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: dataUrl } }] }],
+  }, extra));
+  const call = (extra) => fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST", headers: { Authorization: `Bearer ${cfg.groqKey}`, "Content-Type": "application/json" }, body: body(extra),
+  });
+  let res = await call({ reasoning_format: "hidden" });
+  if (res.status === 400) res = await call({}); // model without reasoning options
+  if (!res.ok) throw new Error(`Vision ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  return String(data.choices[0].message.content || "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +391,9 @@ async function runTool(key, channel, name, input) {
     const how = channel === "web" ? "Website chat" : `WhatsApp +${key.slice(3)}`;
     const resume = channel === "whatsapp" ? `\nSend "resume ${key.slice(3)}" to turn the AI back on.` : "";
     await alertOwner(`🔔 Customer needs you: ${lead.name || "new customer"} (${how})`,
-      `Contact: ${contact}\nWhy: ${input.reason}\nSummary: ${input.summary}${resume}\n\nThe AI has stopped replying to this customer. Please contact them.`);
+      `Contact: ${contact}\nWhy: ${input.reason}\nSummary: ${input.summary}${resume}` +
+      (lead.photos && lead.photos.length ? `\nPhotos: ${lead.photos.join("  ")}` : "") +
+      `\n\nThe AI has stopped replying to this customer. Please contact them.`);
     return "Jackson has been alerted. The AI will stop replying to this customer.";
   }
   return "Unknown tool";
@@ -530,6 +558,9 @@ const WIDGET_JS = `(() => {
   #tn-in{flex:1;border:1px solid #cfd9e6;border-radius:10px;padding:10px 12px;font-size:14px;outline:none;font-family:inherit}
   #tn-in:focus{border-color:\${BLUE}}
   #tn-send{background:\${BLUE};color:#fff;border:0;border-radius:10px;padding:0 16px;font-weight:600;cursor:pointer;font-size:14px}
+  #tn-att{background:#fff;border:1px solid #cfd9e6;border-radius:10px;width:42px;cursor:pointer;font-size:18px;line-height:1;flex:none}
+  #tn-att:disabled{opacity:.5;cursor:default}
+  .tn-photo{max-width:100%;max-height:220px;border-radius:8px;display:block}
   #tn-send:disabled{opacity:.5;cursor:default}
   #tn-foot{font-size:11px;color:#6b7788;text-align:center;padding:0 10px 8px;background:#fff}
   @media (max-width:480px){#tn-panel{right:0;bottom:0;width:100vw;max-width:100vw;height:100%;max-height:100%;border-radius:0}}
@@ -544,7 +575,9 @@ const WIDGET_JS = `(() => {
   panel.id = "tn-panel"; panel.setAttribute("role", "dialog"); panel.setAttribute("aria-label", "TechNova chat");
   panel.innerHTML = '<div id="tn-head"><div><b>TechNova</b><small>Ask about repairs, CCTV, IoT or websites</small></div>' +
     '<button id="tn-close" aria-label="Close chat">×</button></div><div id="tn-log" aria-live="polite"></div>' +
-    '<form id="tn-form"><input id="tn-in" maxlength="1000" autocomplete="off" placeholder="Andika ujumbe / Type a message" aria-label="Message">' +
+    '<form id="tn-form"><button id="tn-att" type="button" aria-label="Tuma picha / Send a photo" title="Tuma picha / Send a photo">📎</button>' +
+    '<input id="tn-file" type="file" accept="image/*" hidden>' +
+    '<input id="tn-in" maxlength="1000" autocomplete="off" placeholder="Andika ujumbe / Type a message" aria-label="Message">' +
     '<button id="tn-send" type="submit">Send</button></form><div id="tn-foot">TechNova AI assistant</div>';
   document.body.appendChild(btn); document.body.appendChild(panel);
 
@@ -589,20 +622,54 @@ const WIDGET_JS = `(() => {
   if (waiting()) startPolling();
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && panel.classList.contains("open")) toggle(false); });
 
-  form.onsubmit = async (e) => {
-    e.preventDefault();
-    const text = input.value.trim(); if (!text) return;
-    add(text, "tn-me"); input.value = ""; send.disabled = true;
-    const typing = add("TechNova inaandika…", "tn-bot tn-typing");
+  const att = panel.querySelector("#tn-att"), file = panel.querySelector("#tn-file");
+  async function sendToChat(text, image) {
+    send.disabled = true; att.disabled = true;
+    const typing = add(image ? "Inaangalia picha… / Looking at your photo…" : "TechNova inaandika…", "tn-bot tn-typing");
     try {
       const r = await fetch(API + "/chat", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: sid, message: text, page: location.pathname }) });
+        body: JSON.stringify({ sessionId: sid, message: text, page: location.pathname, image: image || undefined }) });
       const data = await r.json();
       typing.remove(); add(data.reply || "Sorry, please try again.", "tn-bot");
       if (data.awaiting) waitStart();
     } catch (err) {
       typing.remove(); add("Connection problem. Please call or WhatsApp +255 682 334 222.", "tn-bot");
-    } finally { send.disabled = false; input.focus(); }
+    } finally { send.disabled = false; att.disabled = false; input.focus(); }
+  }
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const text = input.value.trim(); if (!text) return;
+    add(text, "tn-me"); input.value = "";
+    sendToChat(text);
+  };
+  // Photos are shrunk on the phone (max 1280 px, JPEG) so they upload fast on slow networks
+  function shrink(f) {
+    return new Promise((resolve, reject) => {
+      const img = new Image(), url = URL.createObjectURL(f);
+      img.onload = () => {
+        const scale = Math.min(1, 1280 / Math.max(img.width, img.height));
+        const c = document.createElement("canvas");
+        c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        resolve(c.toDataURL("image/jpeg", 0.8));
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("bad image")); };
+      img.src = url;
+    });
+  }
+  att.onclick = () => file.click();
+  file.onchange = async () => {
+    const f = file.files && file.files[0]; file.value = "";
+    if (!f) return;
+    if (!/^image\\//.test(f.type)) { add("Tafadhali tuma picha tu. / Please send a photo.", "tn-bot"); return; }
+    let data;
+    try { data = await shrink(f); } catch (e) { add("Picha haikuweza kufunguliwa. / That photo couldn't be opened.", "tn-bot"); return; }
+    const caption = input.value.trim(); input.value = "";
+    const bubble = add(caption, "tn-me");
+    const im = document.createElement("img"); im.src = data; im.alt = "Picha uliyotuma / Your photo"; im.className = "tn-photo";
+    bubble.insertBefore(im, bubble.firstChild);
+    sendToChat(caption, data);
   };
 })();`;
 
@@ -611,7 +678,7 @@ const WIDGET_JS = `(() => {
 // ---------------------------------------------------------------------------
 const app = express();
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "100kb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: "4mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 app.get("/", (_req, res) => res.send(`TechNova receptionist is running (web chat${whatsappEnabled ? " + WhatsApp" : ""})`));
 
@@ -621,9 +688,13 @@ app.get("/widget.js", (_req, res) => {
 
 app.options("/chat", cors);
 app.post("/chat", cors, async (req, res) => {
-  const { sessionId, message, page } = req.body || {};
+  const { sessionId, page, image } = req.body || {};
+  const message = typeof (req.body || {}).message === "string" ? req.body.message : "";
   if (typeof sessionId !== "string" || !/^[A-Za-z0-9.-]{8,64}$/.test(sessionId)) return res.status(400).json({ reply: "Invalid session." });
-  if (typeof message !== "string" || !message.trim()) return res.status(400).json({ reply: "Please type a message." });
+  const photo = typeof image === "string" ? /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(image) : null;
+  if (image && !photo) return res.status(400).json({ reply: "Samahani, picha hii haikuweza kusomwa. / Sorry, that photo couldn't be read." });
+  if (photo && photo[2].length > 3.5 * 1024 * 1024) return res.status(400).json({ reply: "Picha ni kubwa mno. / That photo is too large." });
+  if (!message.trim() && !photo) return res.status(400).json({ reply: "Please type a message." });
   if (rateLimited(req.ip)) return res.status(429).json({ reply: "Too many messages. Please call or WhatsApp +255 682 334 222 / +255 627 182 180." });
 
   const key = "web:" + sessionId;
@@ -631,9 +702,22 @@ app.post("/chat", cors, async (req, res) => {
   const convo = getConvo(key);
   if (convo.userTurns >= SESSION_LIMIT) return res.json({ reply: HANDED_OVER_WEB });
 
-  const text = message.trim().slice(0, 1000) + (convo.userTurns === 0 && page ? `\n(Visitor is on page: ${String(page).slice(0, 100)})` : "");
+  let text = message.trim().slice(0, 1000) + (convo.userTurns === 0 && page ? `\n(Visitor is on page: ${String(page).slice(0, 100)})` : "");
   try {
-    const reply = await answer(key, "web", text);
+    if (photo) {
+      if ((convo.photoCount || 0) >= 6) return res.json({ reply: "Asante! Tumepokea picha za kutosha; Jackson atawasiliana nawe. / Thanks, we have enough photos; Jackson will contact you." });
+      convo.photoCount = (convo.photoCount || 0) + 1;
+      const [seen, saved] = await Promise.all([
+        describePhoto(image, message).catch((e) => { console.error(e.message); return ""; }),
+        relay({ action: "photo", key, data: photo[2], mime: photo[1], caption: message.slice(0, 300) }).catch(() => null),
+      ]);
+      if (saved && saved.ok) {
+        convo.lead.photos = (convo.lead.photos || []).concat(saved.url);
+        if (convo.leadSaved) saveLead(key, "web", {}).catch(() => {});
+      }
+      text += `\n[The customer sent a photo. ${seen ? "What it shows: " + seen : "It could not be analysed automatically; say you received it and Jackson will look at it."}]`;
+    }
+    const reply = await answer(key, "web", text.trim());
     res.json({ reply: reply || HANDED_OVER_WEB, awaiting: convo.awaiting });
   } catch (e) {
     console.error("Web reply failed:", e.message);
