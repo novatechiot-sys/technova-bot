@@ -76,11 +76,14 @@ Your job:
    - If EVERY service they need is in the PRICE DATABASE with auto=yes, call create_quote with those IDs and quantities.
    - If anything they need is missing from the database or has auto=no, call request_price: put the auto=yes items in known_items and describe the rest in unknown_items. Then tell the customer that Jackson is confirming the price and the quotation (PDF) will appear right here in this chat shortly, and ask for their phone number in case they leave.
    - Never state a total yourself; the PDF has the exact numbers. Never put a site visit fee in a quote.
-5. Call handover_to_human when: the customer wants to book a date, wants a discount, complains, has an urgent problem, asks something you cannot answer, or asks for a person.
+5. ACCEPTING: when the customer accepts a quotation ("nakubali", "I accept", "let's go ahead"), call accept_quote. It sends the deposit invoice (jobs above TZS 200,000) and opens a job card. Then offer to book the visit.
+6. BOOKING: to book a site visit (kind "site_visit") or the work itself (kind "job"), first make sure you have their name, phone number and exact location. Call get_slots, show the options as a short numbered list, and when they choose, call book_slot with that slot's start value. Never invent times; only offer slots from get_slots.
+7. JOB STATUS: when someone asks about a repair or job, ask for their job number (like TN-J-2026-014) and the last 4 digits of their phone number, then call check_job. Report only what it returns.
+8. Call handover_to_human when: the customer wants a discount, complains, has an urgent problem, no slot suits them, asks something you cannot answer, or asks for a person.
    After a handover, tell the customer Jackson from TechNova will contact them shortly.
 
 Hard rules:
-- In normal conversation give prices only as "starting from" ranges. Exact prices come only through create_quote. Never promise a date, discount or availability.
+- In normal conversation give prices only as "starting from" ranges. Exact prices come only through create_quote. Dates come only from get_slots. Never promise discounts.
 - Never invent clients, projects, reviews, stock or policies. If unsure, hand over.
 - Never ask for card numbers, PINs or passwords.
 - If asked, say honestly that you are TechNova's AI assistant.`;
@@ -133,6 +136,39 @@ const TOOL_DEFS = [
         details: { type: "string", description: "Everything Jackson needs to price it: sizes, models, location" },
       },
       required: ["customer_name", "unknown_items", "details"],
+    },
+  },
+  {
+    name: "accept_quote",
+    description: "The customer accepts their quotation. Sends the deposit invoice if needed and opens a job card.",
+    input_schema: { type: "object", properties: { quote_number: { type: "string", description: "e.g. TN-Q-2026-004; leave empty for their latest quote" } } },
+  },
+  {
+    name: "get_slots",
+    description: "Free times in Jackson's calendar for a site visit or a job.",
+    input_schema: { type: "object", properties: { kind: { type: "string", enum: ["site_visit", "job"] } }, required: ["kind"] },
+  },
+  {
+    name: "book_slot",
+    description: "Book the slot the customer chose (start value from get_slots).",
+    input_schema: {
+      type: "object",
+      properties: {
+        start: { type: "string", description: "Exact start value from get_slots, e.g. 2026-10-06T09:00" },
+        kind: { type: "string", enum: ["site_visit", "job"] },
+        address: { type: "string", description: "Exact place of the visit" },
+        notes: { type: "string" },
+      },
+      required: ["start", "kind", "address"],
+    },
+  },
+  {
+    name: "check_job",
+    description: "Look up a job's status in the Jobs Tracker.",
+    input_schema: {
+      type: "object",
+      properties: { job_number: { type: "string" }, phone_last_digits: { type: "string", description: "Last 4 digits of the phone number on the job" } },
+      required: ["job_number"],
     },
   },
   {
@@ -283,6 +319,40 @@ async function runTool(key, channel, name, input) {
     } catch (e) {
       return "Could not reach Jackson automatically. Call handover_to_human instead.";
     }
+  }
+  if (name === "accept_quote") {
+    try {
+      const r = await relay({ action: "accept_quote", key, quote_number: input.quote_number || "" });
+      if (!r || !r.ok) return `Could not accept: ${(r && r.error) || "AI office unavailable"}. Call handover_to_human.`;
+      if (r.invoice && r.invoice.url) convo.links.push(r.invoice.url);
+      return `Accepted. Job card ${r.job}. ${r.message} ${r.invoice ? "The invoice PDF link is shown to the customer automatically. Explain that work starts after the deposit." : ""} Now offer to book the visit (get_slots).`;
+    } catch (e) { return "Could not accept automatically. Call handover_to_human."; }
+  }
+  if (name === "get_slots") {
+    try {
+      const r = await relay({ action: "slots", kind: input.kind });
+      const slots = (r && r.slots) || [];
+      if (!slots.length) return "No free slots in the next 10 days. Call handover_to_human so Jackson can arrange a time.";
+      return "Free slots (show the labels, keep the start values for book_slot):\n" + slots.map((x, i) => `${i + 1}. ${x.label} [start=${x.start}]`).join("\n");
+    } catch (e) { return "Calendar unavailable. Call handover_to_human."; }
+  }
+  if (name === "book_slot") {
+    if (!convo.lead.phone && !convo.lead.email) return "Not booked: ask for the customer's phone number first.";
+    try {
+      const lead = Object.assign({}, convo.lead, { location: input.address || convo.lead.location });
+      const r = await relay({ action: "book", key, lead, start: input.start, kind: input.kind, address: input.address, notes: input.notes || "" });
+      if (!r || !r.ok) return `Not booked: ${(r && r.error) || "calendar unavailable"}`;
+      return `Booked: ${r.label}. Job ${r.job}. Confirm the date, time and place to the customer and give them the job number. They get a reminder the day before.`;
+    } catch (e) { return "Could not book. Call handover_to_human."; }
+  }
+  if (name === "check_job") {
+    try {
+      const r = await relay({ action: "job_status", job: input.job_number, phone_digits: input.phone_last_digits || "" });
+      if (!r) return "Jobs Tracker unavailable. Give the TechNova phone numbers.";
+      if (r.needs_phone) return "Ask for the last 4 digits of the phone number used for this job, then call check_job again.";
+      if (!r.ok) return `Not found: ${r.error}`;
+      return `Job ${r.job} (${r.service}) for ${r.name}: status ${r.status}.${r.note ? " Note: " + r.note : ""}${r.booking ? " Booking: " + r.booking : ""}`;
+    } catch (e) { return "Jobs Tracker unavailable. Give the TechNova phone numbers."; }
   }
   if (name === "save_lead") {
     return saveLead(key, channel, input).catch((e) => { console.error(e); return "Could not save lead"; });
