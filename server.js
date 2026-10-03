@@ -64,28 +64,77 @@ Current offer: free diagnosis when repaired with us (until 31 Oct 2026).
 
 const BASE_PROMPT = `You are TechNova's customer assistant.
 Reply in the customer's language (Swahili or English, match them). Be warm, short (max ~80 words) and practical. Plain text, no markdown.
+When replying in Swahili, write natural Tanzanian Swahili and do not mix in English words. Use these terms:
+quote = "makadirio ya bei" (never "nukuu"); pages = "kurasa" (e.g. "tovuti ya kurasa 5"); website = "tovuti";
+prices as "kuanzia TZS 500,000 hadi 800,000"; phone number = "namba ya simu"; site visit = "kukutembelea".
 
 Your job:
 1. Understand what the customer needs and answer questions using ONLY the company information below.
 2. Collect: name, location, the service needed, and details (device model, problem, number of cameras, farm size, etc.). Ask one or two things at a time.
 3. As soon as you know the service needed and at least one other detail, call save_lead. Call it again when you learn more.
-4. Call handover_to_human when: the customer is ready to book or wants a final quote, wants a discount, complains, has an urgent problem, asks something you cannot answer from the company information, or asks for a person.
+4. QUOTES. When the customer wants a price or quote for specific work, first make sure you know their name and the quantities (e.g. number of cameras, number of pages). Then:
+   - If EVERY service they need is in the PRICE DATABASE with auto=yes, call create_quote with those IDs and quantities.
+   - If anything they need is missing from the database or has auto=no, call request_price: put the auto=yes items in known_items and describe the rest in unknown_items. Then tell the customer that Jackson is confirming the price and the quotation (PDF) will appear right here in this chat shortly, and ask for their phone number in case they leave.
+   - Never state a total yourself; the PDF has the exact numbers. Never put a site visit fee in a quote.
+5. Call handover_to_human when: the customer wants to book a date, wants a discount, complains, has an urgent problem, asks something you cannot answer, or asks for a person.
    After a handover, tell the customer Jackson from TechNova will contact them shortly.
 
 Hard rules:
-- Only give prices as "starting from" ranges from the list. Never promise a final price, date, discount or availability.
+- In normal conversation give prices only as "starting from" ranges. Exact prices come only through create_quote. Never promise a date, discount or availability.
 - Never invent clients, projects, reviews, stock or policies. If unsure, hand over.
 - Never ask for card numbers, PINs or passwords.
-- If asked, say honestly that you are TechNova's AI assistant and that Jackson reviews every quote.`;
+- If asked, say honestly that you are TechNova's AI assistant.`;
 
 const CHANNEL_NOTES = {
   whatsapp: `CHANNEL: WhatsApp. You already have the customer's number. If they send a photo or voice note, say you received it and Jackson will review it.`,
   web: `CHANNEL: chat on TechNova's website. Visitors are anonymous. Before calling handover_to_human, and whenever they want a quote or visit, ask for their phone/WhatsApp number (or email) so Jackson can contact them, and include it in save_lead. If they refuse, give them the TechNova phone numbers instead.`,
 };
 
-const systemPrompt = (channel) => `${BASE_PROMPT}\n\n${CHANNEL_NOTES[channel]}\n\nCOMPANY INFORMATION:\n${COMPANY_BRAIN}`;
+const systemPrompt = (channel) => `${BASE_PROMPT}\n\n${CHANNEL_NOTES[channel]}\n\nCOMPANY INFORMATION:\n${COMPANY_BRAIN}\n\n` +
+  `PRICE DATABASE (ID | service | what's included | unit | price TZS | auto):\n` +
+  (priceCache.list.length ? priceCache.list.map((p) => `${p.id} | ${p.service} | ${p.included} | ${p.unit} | ${p.price} | ${p.auto ? "yes" : "no"}`).join("\n")
+    : "(not available right now: use request_price for every quote)");
+
+// Price Database, read through the AI Office relay and kept for 10 minutes
+const priceCache = { list: [], at: 0 };
+async function refreshPrices() {
+  if (Date.now() - priceCache.at < 10 * 60 * 1000 && priceCache.list.length) return;
+  try {
+    const r = await relay({ action: "prices" });
+    if (r && r.ok && Array.isArray(r.prices)) priceCache.list = r.prices;
+    priceCache.at = Date.now();
+  } catch (e) {
+    console.error("Price Database unavailable:", e.message);
+  }
+}
 
 const TOOL_DEFS = [
+  {
+    name: "create_quote",
+    description: "Make the PDF quotation from Price Database items (all must have auto=yes) and give it to the customer in this chat.",
+    input_schema: {
+      type: "object",
+      properties: {
+        customer_name: { type: "string" },
+        items: { type: "array", items: { type: "object", properties: { id: { type: "string" }, qty: { type: "number" } }, required: ["id", "qty"] } },
+      },
+      required: ["customer_name", "items"],
+    },
+  },
+  {
+    name: "request_price",
+    description: "Ask Jackson for prices that are not in the Price Database. The quotation appears in this chat when he answers.",
+    input_schema: {
+      type: "object",
+      properties: {
+        customer_name: { type: "string" },
+        known_items: { type: "array", description: "Price Database items with auto=yes", items: { type: "object", properties: { id: { type: "string" }, qty: { type: "number" } }, required: ["id", "qty"] } },
+        unknown_items: { type: "array", description: "Work not in the database, or database items with auto=no (then also give their id), described clearly", items: { type: "object", properties: { id: { type: "string", description: "Price Database ID if the item is in the database with auto=no" }, description: { type: "string" }, qty: { type: "number" } }, required: ["description", "qty"] } },
+        details: { type: "string", description: "Everything Jackson needs to price it: sizes, models, location" },
+      },
+      required: ["customer_name", "unknown_items", "details"],
+    },
+  },
   {
     name: "save_lead",
     description: "Save or update this customer's lead in the TechNova Leads Tracker.",
@@ -98,7 +147,7 @@ const TOOL_DEFS = [
         service: { type: "string", description: "Service needed, e.g. 'CCTV 4 cameras' or 'laptop screen repair'" },
         location: { type: "string" },
         details: { type: "string", description: "Short summary of what they need" },
-        status: { type: "string", enum: ["New", "Ready to quote", "Handed over"] },
+        status: { type: "string", enum: ["New", "Handed over"] },
       },
       required: ["service", "details"],
     },
@@ -133,7 +182,7 @@ const TTL_MS = 24 * 60 * 60 * 1000;
 function getConvo(key) {
   const c = conversations.get(key);
   if (c && Date.now() - c.updated < TTL_MS) return c;
-  const fresh = { messages: [], updated: Date.now(), lead: {}, userTurns: 0 };
+  const fresh = { messages: [], updated: Date.now(), lead: {}, userTurns: 0, links: [], awaiting: false };
   conversations.set(key, fresh);
   return fresh;
 }
@@ -203,6 +252,38 @@ function parseArgs(raw) {
 }
 
 async function runTool(key, channel, name, input) {
+  const convo = getConvo(key);
+  if (name === "create_quote" || name === "request_price") {
+    if (input.customer_name && !convo.lead.name) convo.lead.name = input.customer_name;
+    await saveLead(key, channel, { name: input.customer_name, service: convo.lead.service || "Quote request", details: convo.lead.details || input.details || "Quote request" }).catch(() => {});
+    const lead = Object.assign({}, convo.lead);
+    const source = channel === "web" ? "Website chat" : "WhatsApp";
+    if (name === "create_quote") {
+      const bad = (input.items || []).filter((it) => {
+        const p = priceCache.list.find((x) => x.id === String(it.id).toUpperCase());
+        return !p || !p.auto;
+      });
+      if (!(input.items || []).length || bad.length) {
+        return `Not created: ${bad.map((b) => b.id).join(", ") || "no items"} cannot be auto-quoted. Use request_price for those items.`;
+      }
+      try {
+        const r = await relay({ action: "quote", key, source, lead, items: input.items });
+        if (!r || !r.ok) return `Quote failed: ${(r && r.error) || "AI office unavailable"}. Use request_price instead.`;
+        convo.links.push(r.url);
+        return `Quotation ${r.number} created (total TZS ${r.total}). The PDF link is shown to the customer automatically. Tell them briefly it is ready and how to go ahead (reply here or call +255 682 334 222).`;
+      } catch (e) {
+        return "Quote failed: AI office unavailable. Use request_price instead.";
+      }
+    }
+    try {
+      const r = await relay({ action: "price_request", key, source, lead, known_items: input.known_items || [], unknown_items: input.unknown_items || [], details: input.details || "" });
+      if (!r || !r.ok) throw new Error((r && r.error) || "relay error");
+      convo.awaiting = true;
+      return `Jackson has been asked for the price (${r.id}). Tell the customer the quotation (PDF) will appear here in this chat as soon as he confirms, usually within the hour during working hours, and ask for a phone number in case they leave.`;
+    } catch (e) {
+      return "Could not reach Jackson automatically. Call handover_to_human instead.";
+    }
+  }
   if (name === "save_lead") {
     return saveLead(key, channel, input).catch((e) => { console.error(e); return "Could not save lead"; });
   }
@@ -221,6 +302,7 @@ async function runTool(key, channel, name, input) {
 }
 
 async function answer(key, channel, userText) {
+  await refreshPrices();
   const convo = getConvo(key);
   convo.userTurns++;
   convo.messages.push({ role: "user", content: userText });
@@ -234,7 +316,9 @@ async function answer(key, channel, userText) {
 
     if (toolCalls.length === 0) {
       convo.updated = Date.now();
-      return (msg.content || "").trim();
+      let text = (msg.content || "").trim();
+      convo.links.splice(0).forEach((url) => { if (!text.includes(url)) text += `\n\n📄 ${url}`; });
+      return text;
     }
     for (const t of toolCalls) {
       const result = await runTool(key, channel, t.function.name, parseArgs(t.function.arguments));
@@ -391,18 +475,48 @@ const WIDGET_JS = `(() => {
   panel.innerHTML = '<div id="tn-head"><div><b>TechNova</b><small>Ask about repairs, CCTV, IoT or websites</small></div>' +
     '<button id="tn-close" aria-label="Close chat">×</button></div><div id="tn-log" aria-live="polite"></div>' +
     '<form id="tn-form"><input id="tn-in" maxlength="1000" autocomplete="off" placeholder="Andika ujumbe / Type a message" aria-label="Message">' +
-    '<button id="tn-send" type="submit">Send</button></form><div id="tn-foot">AI assistant · Jackson reviews every quote</div>';
+    '<button id="tn-send" type="submit">Send</button></form><div id="tn-foot">TechNova AI assistant</div>';
   document.body.appendChild(btn); document.body.appendChild(panel);
 
   const log = panel.querySelector("#tn-log"), form = panel.querySelector("#tn-form"),
         input = panel.querySelector("#tn-in"), send = panel.querySelector("#tn-send");
-  function add(text, who) { const d = document.createElement("div"); d.className = "tn-m " + who; d.textContent = text;
-    log.appendChild(d); log.scrollTop = log.scrollHeight; return d; }
+  function add(text, who) {
+    const d = document.createElement("div"); d.className = "tn-m " + who;
+    String(text).split(/(https:\\/\\/[^\\s]+)/).forEach((part) => {
+      if (/^https:\\/\\//.test(part)) {
+        const a = document.createElement("a"); a.href = part; a.target = "_blank"; a.rel = "noopener";
+        const isQuote = /drive\\.google\\.com/.test(part);
+        a.textContent = isQuote ? "Fungua makadirio (PDF) / Open quotation (PDF)" : part;
+        a.style.cssText = "color:inherit;font-weight:600;text-decoration:underline;" + (isQuote ? "" : "word-break:break-all");
+        d.appendChild(a);
+      } else if (part) d.appendChild(document.createTextNode(part));
+    });
+    log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
+  }
+  // Waiting for a quote Jackson is pricing: check every 20 seconds for up to 3 hours, also after a page reload
+  let pollTimer = null;
+  function waitStart() { try { localStorage.setItem("tn_wait", String(Date.now())); } catch (e) {} startPolling(); }
+  function waiting() { try { return Date.now() - Number(localStorage.getItem("tn_wait") || 0) < 3 * 3600 * 1000; } catch (e) { return false; } }
+  function startPolling() { if (!pollTimer) { poll(); pollTimer = setInterval(poll, 20000); } }
+  async function poll() {
+    if (!waiting()) { clearInterval(pollTimer); pollTimer = null; return; }
+    try {
+      const r = await fetch(API + "/poll", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: sid }) });
+      const data = await r.json();
+      (data.messages || []).forEach((m) => {
+        if (!greeted) { greeted = true; add("Habari! 👋 Karibu TechNova.", "tn-bot"); }
+        add(m.text, "tn-bot");
+        if (!panel.classList.contains("open")) btn.style.boxShadow = "0 0 0 4px #ff3b30";
+        if (m.done) { try { localStorage.removeItem("tn_wait"); } catch (e) {} }
+      });
+    } catch (e) {}
+  }
   let greeted = false;
-  function toggle(open) { panel.classList.toggle("open", open); if (open) { if (!greeted) { greeted = true;
+  function toggle(open) { panel.classList.toggle("open", open); if (open) { btn.style.boxShadow = ""; if (!greeted) { greeted = true;
     add("Habari! 👋 Karibu TechNova. Tunaweza kukusaidia nini leo?\\nHello! How can we help you today?", "tn-bot"); } input.focus(); } else btn.focus(); }
   btn.onclick = () => toggle(!panel.classList.contains("open"));
   panel.querySelector("#tn-close").onclick = () => toggle(false);
+  if (waiting()) startPolling();
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && panel.classList.contains("open")) toggle(false); });
 
   form.onsubmit = async (e) => {
@@ -415,6 +529,7 @@ const WIDGET_JS = `(() => {
         body: JSON.stringify({ sessionId: sid, message: text, page: location.pathname }) });
       const data = await r.json();
       typing.remove(); add(data.reply || "Sorry, please try again.", "tn-bot");
+      if (data.awaiting) waitStart();
     } catch (err) {
       typing.remove(); add("Connection problem. Please call or WhatsApp +255 682 334 222.", "tn-bot");
     } finally { send.disabled = false; input.focus(); }
@@ -449,11 +564,30 @@ app.post("/chat", cors, async (req, res) => {
   const text = message.trim().slice(0, 1000) + (convo.userTurns === 0 && page ? `\n(Visitor is on page: ${String(page).slice(0, 100)})` : "");
   try {
     const reply = await answer(key, "web", text);
-    res.json({ reply: reply || HANDED_OVER_WEB });
+    res.json({ reply: reply || HANDED_OVER_WEB, awaiting: convo.awaiting });
   } catch (e) {
     console.error("Web reply failed:", e.message);
     alertOwner("⚠️ TechNova receptionist error (website chat)", e.message.slice(0, 300));
     res.json({ reply: FALLBACK_WEB });
+  }
+});
+
+// The chat bubble asks here for quotes that arrived after Jackson answered a price request
+const pollHits = new Map();
+app.options("/poll", cors);
+app.post("/poll", cors, async (req, res) => {
+  const { sessionId } = req.body || {};
+  if (typeof sessionId !== "string" || !/^[A-Za-z0-9.-]{8,64}$/.test(sessionId)) return res.status(400).json({ messages: [] });
+  const now = Date.now(), hits = (pollHits.get(req.ip) || []).filter((t) => now - t < 10 * 60 * 1000);
+  hits.push(now); pollHits.set(req.ip, hits);
+  if (hits.length > 80) return res.status(429).json({ messages: [] });
+  try {
+    const r = await relay({ action: "pull", key: "web:" + sessionId });
+    const messages = (r && r.messages) || [];
+    if (messages.some((m) => m.done)) getConvo("web:" + sessionId).awaiting = false;
+    res.json({ messages });
+  } catch (e) {
+    res.json({ messages: [] });
   }
 });
 
