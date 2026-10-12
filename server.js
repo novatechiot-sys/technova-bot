@@ -42,7 +42,7 @@ const COMPANY_BRAIN = `
 COMPANY: TechNova Electronics & IoT, Arusha, Tanzania. "Turning Ideas into Smart Solutions".
 Phone/WhatsApp: +255 682 334 222 / +255 627 182 180. Email: novatech.iot@gmail.com.
 Website: https://technova-m4cq.onrender.com
-Working hours: Mon–Sat 8:00–22:00. Site visits: within Arusha; other regions by arrangement. Software work: anywhere.
+Working hours: [FILL IN]. Site visits: within Arusha; other regions by arrangement. Software work: anywhere.
 
 STARTING PRICES (TZS). Labour and parts are priced separately; parts at cost.
 Electronics repair (labour, parts extra): diagnosis 5,000 (free if repaired with us); phone software/flashing 15,000-30,000;
@@ -743,6 +743,26 @@ app.post("/poll", cors, async (req, res) => {
   } catch (e) {
     res.json({ messages: [] });
   }
+});
+
+// OpenStreetMap lookups for the AI Office's marketing employee (Google's servers are refused by some map servers)
+app.post("/osm", async (req, res) => {
+  const { secret, query } = req.body || {};
+  if (!cfg.relaySecret || secret !== cfg.relaySecret) return res.status(401).json({ error: "unauthorized" });
+  if (typeof query !== "string" || query.length > 600 || !/^\[out:json\]/.test(query)) return res.status(400).json({ error: "bad query" });
+  const servers = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "https://overpass.kumi.systems/api/interpreter"];
+  const tried = [];
+  for (const url of servers) {
+    try {
+      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "data=" + encodeURIComponent(query), signal: AbortSignal.timeout(35000) });
+      const text = await r.text();
+      if (r.ok && /^\s*\{/.test(text)) return res.type("application/json").send(text);
+      tried.push(`${new URL(url).host} ${r.status}`);
+    } catch (e) { tried.push(`${new URL(url).host} ${e.name}`); }
+  }
+  res.status(502).json({ error: "all map servers failed: " + tried.join(", ") });
 });
 
 // WhatsApp webhook (ignored unless WhatsApp is configured)
